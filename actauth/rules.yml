@@ -1,0 +1,25 @@
+# decision: allow for all four tools — none of them has a destructive or
+# irreversible side effect to gate. schedule_task/cancel_scheduled_task
+# only ever write this ability's own task records; list/check are
+# read-only. The real thing worth being careful about — a forgotten
+# recurring task quietly billing model calls forever — isn't something
+# actauth can meaningfully gate (the cost is in what the *target* agent's
+# own tools do once the scheduled message arrives, already covered by
+# that agent's own rules); see the skill for guidance on surfacing that
+# cost to the operator instead.
+- name: schedule-task-allowed
+  scope: "*/*"
+  tool: schedule_task
+  decision: allow
+- name: list-scheduled-tasks-allowed
+  scope: "*/*"
+  tool: list_scheduled_tasks
+  decision: allow
+- name: check-scheduled-task-allowed
+  scope: "*/*"
+  tool: check_scheduled_task
+  decision: allow
+- name: cancel-scheduled-task-allowed
+  scope: "*/*"
+  tool: cancel_scheduled_task
+  decision: allow
