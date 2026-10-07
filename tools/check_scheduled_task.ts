@@ -17,7 +17,7 @@ interface TaskRecord {
   agent: string
   message: string
   schedule: { run_at: string } | { every: string }
-  status: 'scheduled' | 'cancelled' | 'done'
+  status: 'scheduled' | 'cancelled' | 'done' | 'awaiting_approval'
   created_at: string
   next_run_at?: string
   run_count: number
@@ -25,6 +25,7 @@ interface TaskRecord {
   last_status?: 'ok' | 'error'
   last_result?: string
   last_error?: string
+  pending?: { ran_at: string; session_id: string; pending_ids: string[] }
   history: TaskRunRecord[]
 }
 
@@ -41,7 +42,7 @@ async function readTask(taskId: string): Promise<TaskRecord | undefined> {
 export const checkScheduledTask: ToolDefinition = {
   name: 'check_scheduled_task',
   description:
-    'Get one scheduled task\'s full detail by task_id — its schedule, current status, next_run_at, and recent run history (each entry\'s own status: "ok" with the target agent\'s own reply text, or "error" if the run itself failed — e.g. the target agent no longer exists, or every tool call it tried got auto-denied with no human present to approve it).',
+    'Get one scheduled task\'s full detail by task_id — its schedule, current status, next_run_at, and recent run history (each entry\'s own status: "ok" with the target agent\'s own reply text, or "error" if the run itself failed — e.g. the target agent no longer exists, or every tool call it tried got auto-denied with no human present to approve it). status "awaiting_approval" means the most recent fire hit a real durable approval (the target agent has its own httpNotifier configured, e.g. Slack or a webhook) and is still waiting on a human to decide — pending.pending_ids/session_id identify exactly which; nothing else happens for this task until that\'s resolved.',
   input_schema: {
     type: 'object',
     properties: {

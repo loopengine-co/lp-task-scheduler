@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { discoverAgents, runAgent, type ToolDefinition } from 'loopengine'
+import { createCheckpointStore, createSessionStore, discoverAgents, runAgent, type Message, type OutstandingItem, type ToolDefinition } from 'loopengine'
 
 // This file's own top-level code (startScheduler() at the bottom) is
 // what actually runs the scheduler — not the schedule_task tool's own
@@ -24,9 +24,27 @@ import { discoverAgents, runAgent, type ToolDefinition } from 'loopengine'
 // instantiates — and starts a scheduler loop for — each one
 // separately) — installing it twice in the same project means two
 // independent loops both polling SCHEDULER_STORE_DIR, which (if left
-// at its own shared default) means every due task fires twice. A
-// scheduled task's own `agent` field can still target any agent in the
-// project; only the *scheduler ability itself* needs a single home.
+// at its own shared default) means every due task fires twice —
+// confirmed live while testing this exact file. A scheduled task's own
+// `agent` field can still target any agent in the project; only the
+// *scheduler ability itself* needs a single home.
+//
+// An 'ask' decision a fired task hits can become a real, later-
+// resolvable durable approval — not just an immediate auto-deny — when
+// the *target* agent has its own httpNotifier configured (see
+// fireTask/checkResolution below). This needed no changes to
+// loopengine core or adapters/http.ts at all to support: createCheckpointStore()/
+// createSessionStore() both resolve their backing purely from env vars
+// (REDIS_URL, or a fixed local path) at construction time — since this
+// file runs inside the exact same process as adapters/http.ts, reading
+// the exact same env vars, an instance created here and that file's own
+// already-running equivalent resolve to the identical backing store.
+// adapters/http.ts's own already-existing /pending-approvals/:id/resolve
+// route, completely unmodified, is what actually resolves a checkpoint
+// this file creates — confirmed live, across two separate Node
+// processes, that a scheduled run's own durable approval round-trips
+// correctly through it, including a chained second approval spawned by
+// resolving the first.
 
 interface TaskRunRecord {
   ran_at: string
@@ -43,16 +61,29 @@ interface TaskRecord {
   schedule: { run_at: string } | { every: string }
   // 'done' only ever applies to a one-off (run_at) task after it fires
   // once — a recurring (every) task stays 'scheduled' indefinitely
-  // until cancelled.
-  status: 'scheduled' | 'cancelled' | 'done'
+  // until cancelled. 'awaiting_approval' — see fireTask's own doc
+  // comment — means the fire that just happened hit a durable ('ask')
+  // decision with nobody live to answer it; a recurring task doesn't
+  // compute a fresh next_run_at or fire again while in this state, so
+  // a slow-to-resolve approval can't pile up duplicate pending requests
+  // for the same recurring task.
+  status: 'scheduled' | 'cancelled' | 'done' | 'awaiting_approval'
   created_at: string
-  // Absent once status is 'cancelled'/'done' — nothing left to wait for.
+  // Absent once status is 'cancelled'/'done'/'awaiting_approval' —
+  // nothing left to wait for on a fixed clock in any of those states.
   next_run_at?: string
   run_count: number
   last_run_at?: string
   last_status?: 'ok' | 'error'
   last_result?: string
   last_error?: string
+  // Only set while status is 'awaiting_approval' — see fireTask's own
+  // doc comment for what each identifies and why both are needed to
+  // eventually resolve it. ran_at is when this fire actually happened,
+  // not whenever it eventually gets noticed as resolved — checkResolution
+  // uses it to record the real run time, same as every other fire's own
+  // history entry already does.
+  pending?: { ran_at: string; session_id: string; pending_ids: string[] }
   // Capped to HISTORY_LIMIT most recent runs — see fireTask below. A
   // task left running for months at a short interval would otherwise
   // grow this file without bound.
@@ -110,6 +141,38 @@ function parseEvery(every: string): number {
 const NO_HUMAN_AVAILABLE_ANSWER =
   'No human is available to answer — this is an unattended scheduled run. Use your own best judgement and proceed without waiting for a response.'
 
+// Both zero-argument factories — each resolves its own backing purely
+// from REDIS_URL (or a fixed local path) at construction time, with no
+// config passed in at all. That's what makes a *durable* ('ask' with a
+// webhook/Slack-configured target agent) approval work with zero
+// coordination: this ability runs inside the exact same process as
+// adapters/http.ts, reading the exact same env vars, so this instance
+// and that file's own already-running `checkpoints`/`sessions`
+// variables resolve to the identical backing store (the same Redis
+// instance, or the same .checkpoints/.sessions directory on disk) —
+// adapters/http.ts's own already-existing /pending-approvals/:id/resolve
+// and /approvals/:id/approve routes, completely unmodified, are what
+// actually resolve a checkpoint this file creates; this file never
+// needs to serve that resolution itself.
+const checkpoints = createCheckpointStore()
+const sessions = createSessionStore()
+// Same default tenant/environment runAgent()/adapters/http.ts itself
+// falls back to when neither is given a real one from a live request —
+// a scheduled fire has no request to resolve either from, so this is
+// the only sensible, fixed choice; see RunAgentOptions.tenant's own doc
+// comment ("Default 'default'... every standalone/CLI caller... gets
+// that default automatically").
+const TENANT = 'default'
+const ENVIRONMENT = process.env.LOOPENGINE_ENV ?? 'production'
+
+// Mirrors adapters/http.ts's own storageSessionId composition exactly
+// (handleSessionGet/respondAfterResolution) — this is the one thing
+// that has to match byte-for-byte for sessions.getHistory below to ever
+// find what a resolved checkpoint's own resumed turn wrote.
+function storageSessionId(agent: string, rawSessionId: string): string {
+  return `${TENANT}:${ENVIRONMENT}:${agent}:${rawSessionId}`
+}
+
 // Guards against firing the same task twice if a run is still mid-flight
 // when a later tick notices the same (stale, not-yet-updated) next_run_at
 // on disk — module-scope, in-memory, deliberately not persisted: it only
@@ -117,42 +180,21 @@ const NO_HUMAN_AVAILABLE_ANSWER =
 // restart.
 const inFlight = new Set<string>()
 
-async function fireTask(task: TaskRecord): Promise<void> {
-  const ranAt = new Date().toISOString()
-  let status: 'ok' | 'error'
-  let result: string | undefined
-  let error: string | undefined
-  try {
-    const agents = await discoverAgents(AGENTS_DIR)
-    const agentModule = agents.get(task.agent)
-    if (!agentModule) throw new Error(`no such agent "${task.agent}" in this project`)
-    const runResult = await runAgent(agentModule.config, agentModule.createModelCall(), task.message, [], {
-      // Both resolve immediately rather than block this tick (and every
-      // other due task behind it in the same tick, since inFlight only
-      // guards *this* task) on a human who was never going to answer —
-      // see this file's own top-of-file doc comment. A durable
-      // approver/question handler was deliberately not used instead:
-      // that would leave a pendingId nobody will ever resolve sitting in
-      // actauth's/ask_user's own in-memory pending maps forever, a slow
-      // leak across every recurring run that ever hits an 'ask' rule or
-      // calls system_ask_user — an immediate, visible decision (denied/
-      // a fixed answer) has nothing left dangling afterward.
-      approver: { requestApproval: async () => false },
-      questionHandler: { requestQuestion: async () => NO_HUMAN_AVAILABLE_ANSWER },
-    })
-    status = 'ok'
-    result = runResult.text
-  } catch (err) {
-    status = 'error'
-    error = err instanceof Error ? err.message : String(err)
-  }
-
-  // Re-read from disk right before writing back, rather than mutating
-  // the in-memory `task` this function was called with — a long-running
-  // run can overlap a cancel_scheduled_task call that landed while it
-  // was in flight; writing back the stale in-memory copy would silently
-  // undo that cancellation.
-  const current = await readTask(task.task_id)
+// Settles a completed (approved, denied, or never hit an 'ask' at all)
+// run's own final outcome into the task record — shared by fireTask
+// (the immediate, no-pending-approval case) and checkResolution below
+// (the delayed case, once a previously-pending approval finally
+// settles). `ranAt` is when the *original* fire happened, not when
+// this particular settlement is observed — a run resolved three days
+// after it fired should still record when it actually ran, not when
+// someone happened to click Approve.
+async function settleRun(taskId: string, ranAt: string, status: 'ok' | 'error', result: string | undefined, error: string | undefined): Promise<void> {
+  // Re-read from disk right before writing back, rather than trusting
+  // an in-memory copy from whenever this run actually started — a
+  // long-running (or long-pending) run can overlap a
+  // cancel_scheduled_task call that landed while it was in flight;
+  // writing back a stale copy would silently undo that cancellation.
+  const current = await readTask(taskId)
   if (!current || current.status === 'cancelled') return
 
   current.run_count++
@@ -160,6 +202,7 @@ async function fireTask(task: TaskRecord): Promise<void> {
   current.last_status = status
   current.last_result = result
   current.last_error = error
+  current.pending = undefined
   current.history.push({ ran_at: ranAt, status, result, error })
   if (current.history.length > HISTORY_LIMIT) current.history = current.history.slice(-HISTORY_LIMIT)
 
@@ -167,13 +210,131 @@ async function fireTask(task: TaskRecord): Promise<void> {
     current.status = 'done'
     current.next_run_at = undefined
   } else {
+    current.status = 'scheduled'
     // Resumes from *now*, not from however many intervals were missed
-    // while the server happened to be down — a long outage fires the
-    // task once on restart and schedules fresh from there, instead of
-    // bursting through every interval it slept through.
+    // while the server happened to be down (or this one run sat
+    // awaiting approval) — a long gap fires the task once and schedules
+    // fresh from there, instead of bursting through everything it
+    // missed.
     current.next_run_at = new Date(Date.now() + parseEvery(current.schedule.every)).toISOString()
   }
   await writeTask(current)
+}
+
+async function fireTask(task: TaskRecord): Promise<void> {
+  const ranAt = new Date().toISOString()
+  const rawSessionId = `${task.task_id}-run-${task.run_count + 1}`
+  try {
+    const agents = await discoverAgents(AGENTS_DIR)
+    const agentModule = agents.get(task.agent)
+    if (!agentModule) throw new Error(`no such agent "${task.agent}" in this project`)
+    const runResult = await runAgent(agentModule.config, agentModule.createModelCall(), task.message, [], {
+      tenant: TENANT,
+      sessionId: rawSessionId,
+      // 'http' is what lets the target agent's own AgentConfig.httpNotifier
+      // (a real webhook/Slack/webchat target the operator configured on
+      // *that* agent) actually get consulted for an 'ask' decision — see
+      // RunAgentOptions.approver's own doc comment: an agent's own
+      // httpNotifier, if it covers 'approval'/'question', wins outright
+      // over whatever's passed below, which only ever applies as a
+      // fallback for a target agent that configured neither. That
+      // fallback resolves immediately (deny / a fixed answer) rather
+      // than risk hanging on a human who was never going to answer —
+      // same reasoning as this file's own top-of-file doc comment, now
+      // scoped to exactly the agents that haven't opted into durable
+      // approval at all.
+      channel: 'http',
+      approver: { requestApproval: async () => false },
+      questionHandler: { requestQuestion: async () => NO_HUMAN_AVAILABLE_ANSWER },
+    })
+
+    if (runResult.pending) {
+      // Hit a durable ('ask', with the target agent's own httpNotifier
+      // covering it) decision instead of resolving immediately — the
+      // turn is genuinely paused, possibly for days, waiting for a
+      // human to click Approve/Deny wherever that agent's own
+      // httpNotifier actually delivers to. Persist exactly what
+      // adapters/http.ts's own createCheckpointFromPending persists for
+      // a live request hitting the same situation — its own, already-
+      // running /pending-approvals/:id/resolve route (reading from this
+      // same checkpoint store, per this file's own top-of-file doc
+      // comment) is what actually resolves this later; nothing further
+      // happens here until checkResolution notices it's gone.
+      const outstanding: Record<string, OutstandingItem> = {}
+      for (const item of runResult.pending.outstanding) {
+        outstanding[item.pendingId] = { kind: item.kind, toolUseId: item.toolUseId, tool: item.tool, args: item.args, reason: item.reason }
+      }
+      await checkpoints.create({ sessionId: rawSessionId, agent: task.agent, tenant: TENANT, resultsSoFar: runResult.pending.resultsSoFar, outstanding })
+
+      const current = await readTask(task.task_id)
+      if (!current || current.status === 'cancelled') return
+      current.status = 'awaiting_approval'
+      current.next_run_at = undefined
+      current.pending = { ran_at: ranAt, session_id: rawSessionId, pending_ids: runResult.pending.outstanding.map((o) => o.pendingId) }
+      await writeTask(current)
+      return
+    }
+
+    await settleRun(task.task_id, ranAt, 'ok', runResult.text, undefined)
+  } catch (err) {
+    await settleRun(task.task_id, ranAt, 'error', undefined, err instanceof Error ? err.message : String(err))
+  }
+}
+
+// For a task currently 'awaiting_approval' — checks whether every
+// outstanding pendingId from that fire has resolved (the checkpoint
+// they belonged to is gone — see CheckpointStore.withCheckpoint's own
+// doc comment: a resolved checkpoint is deleted, "nothing revisits a
+// closed checkpoint again"), and if so, pulls the resumed turn's own
+// final text out of the session store and settles the run exactly like
+// an immediate (non-pending) fire would have. withCheckpoint is
+// otherwise a mutating, exclusive-access API (it persists whatever `fn`
+// returns) — passing it straight back unchanged is what makes this a
+// safe, side-effect-free peek rather than an accidental resolution of
+// its own.
+// Checking whether task.pending's own tracked pendingIds are gone from
+// the checkpoint store is NOT a reliable completion signal on its own —
+// confirmed live: resumeAgent's own doc comment says a resumed turn
+// "can itself return with stopReason 'pending_approval' again," and
+// adapters/http.ts's own respondAfterResolution does exactly that
+// (createCheckpointFromPending again, for a brand new pendingId my own
+// task record never learns about) — so "the *original* pendingId is
+// gone" can mean "fully done" or "immediately replaced by a second,
+// untracked approval request three seconds later," and there's no way
+// to tell those apart from the checkpoint store alone. The one
+// unambiguous signal is the session's own history: still-pending (one
+// hop or five) always ends in the dangling assistant tool_use message
+// that triggered whichever approval is currently outstanding — a
+// genuinely finished turn is the only case that ends in a plain-string
+// final assistant message instead. task.pending.pending_ids is
+// therefore purely informational after the *first* hop — accurate for
+// a single-approval turn, possibly stale for a chained one — see
+// check_scheduled_task's own description.
+// A plain-text final answer isn't necessarily stored as a plain
+// string — confirmed live: SessionStore's own on-disk JSONL
+// reconstruction round-trips it as content: [{ type: 'text', text:
+// '...' }] instead, even though runLoop's own in-memory pushMessage
+// uses a bare string for exactly this case. Any tool_use block present
+// means the turn is still mid-flight (a dangling call about to get a
+// tool_result, not an actual final answer yet) regardless of which
+// shape the text itself takes.
+function extractFinalText(message: Message | undefined): string | undefined {
+  if (!message || message.role !== 'assistant') return undefined
+  if (typeof message.content === 'string') return message.content
+  if (!Array.isArray(message.content) || message.content.some((b) => b.type !== 'text')) return undefined
+  const text = message.content
+    .map((b) => b.text)
+    .filter((t): t is string => typeof t === 'string')
+    .join('\n')
+  return text || undefined
+}
+
+async function checkResolution(task: TaskRecord): Promise<void> {
+  if (!task.pending) return
+  const history = await sessions.getHistory(storageSessionId(task.agent, task.pending.session_id))
+  const text = extractFinalText(history[history.length - 1])
+  if (text === undefined) return
+  await settleRun(task.task_id, task.pending.ran_at, 'ok', text, undefined)
 }
 
 async function tick(): Promise<void> {
@@ -181,7 +342,17 @@ async function tick(): Promise<void> {
   for (const taskId of await listTaskIds()) {
     if (inFlight.has(taskId)) continue
     const task = await readTask(taskId)
-    if (!task || task.status !== 'scheduled' || !task.next_run_at) continue
+    if (!task) continue
+
+    if (task.status === 'awaiting_approval') {
+      inFlight.add(taskId)
+      checkResolution(task)
+        .catch((err) => console.error(`[schedule_task] unexpected error checking resolution for task ${taskId}:`, err))
+        .finally(() => inFlight.delete(taskId))
+      continue
+    }
+
+    if (task.status !== 'scheduled' || !task.next_run_at) continue
     if (new Date(task.next_run_at).getTime() > now) continue
     inFlight.add(taskId)
     fireTask(task)
@@ -200,7 +371,7 @@ startScheduler()
 export const scheduleTask: ToolDefinition = {
   name: 'schedule_task',
   description:
-    'Schedule a message to be sent to an agent later — once at a specific time, or on a recurring interval — the same way a cron job runs a command on a timer. The target agent runs exactly as if a user had just sent it that message: it can call its own tools, just with no human able to answer an interactive approval/question (both auto-resolve immediately — see check_scheduled_task\'s own result for what actually happened). Returns a task_id immediately; the task itself fires later, in the background, independent of this conversation. Poll check_scheduled_task to see whether/how it ran.',
+    'Schedule a message to be sent to an agent later — once at a specific time, or on a recurring interval — the same way a cron job runs a command on a timer. The target agent runs exactly as if a user had just sent it that message: it can call its own tools, just with no human live in the conversation. If the target agent has its own httpNotifier configured, an "ask" decision becomes a real durable approval (the run pauses, check_scheduled_task reports "awaiting_approval", and it resumes once a human decides via whatever that agent\'s own httpNotifier delivers to) — otherwise it auto-resolves immediately (denied / a fixed "no human available" answer) instead of ever actually asking anyone. Returns a task_id immediately; the task itself fires later, in the background, independent of this conversation. Poll check_scheduled_task to see whether/how it ran.',
   input_schema: {
     type: 'object',
     properties: {

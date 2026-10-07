@@ -13,7 +13,7 @@ interface TaskRecord {
   agent: string
   message: string
   schedule: { run_at: string } | { every: string }
-  status: 'scheduled' | 'cancelled' | 'done'
+  status: 'scheduled' | 'cancelled' | 'done' | 'awaiting_approval'
   created_at: string
   next_run_at?: string
   run_count: number
@@ -41,13 +41,13 @@ async function readTask(taskId: string): Promise<TaskRecord | undefined> {
 export const listScheduledTasks: ToolDefinition = {
   name: 'list_scheduled_tasks',
   description:
-    'List every scheduled task in this deployment — across every agent, not just the one this call is running in. Each entry is a summary (task_id, task_name, agent, schedule, status, next_run_at, run_count, last_status) — call check_scheduled_task for one task\'s own full run history. Useful before creating a new recurring task, to check whether a similar one already exists rather than creating a duplicate.',
+    'List every scheduled task in this deployment — across every agent, not just the one this call is running in. Each entry is a summary (task_id, task_name, agent, schedule, status, next_run_at, run_count, last_status) — call check_scheduled_task for one task\'s own full run history. status "awaiting_approval" means that fire hit a durable approval with no human live to answer it, and is still waiting on whoever the target agent\'s own httpNotifier delivers to (Slack, a webhook, ...) to decide. Useful before creating a new recurring task, to check whether a similar one already exists rather than creating a duplicate.',
   input_schema: {
     type: 'object',
     properties: {
       status: {
         type: 'string',
-        enum: ['scheduled', 'cancelled', 'done'],
+        enum: ['scheduled', 'cancelled', 'done', 'awaiting_approval'],
         description: 'Optional — only list tasks with this exact status. Omit to list every task regardless of status.',
       },
     },

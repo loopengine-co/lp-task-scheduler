@@ -17,11 +17,15 @@ to use it.
   `{ task_id, agent, next_run_at }` immediately — the message itself
   fires later, in the background, independent of whatever conversation
   created it. The target agent runs exactly as if a user had sent that
-  message, with one real difference: no human is present when it fires
-  unattended, so any interactive approval/question the target agent's
-  own rules would normally ask a live person auto-resolves immediately
-  instead (denied / a fixed "no human available" answer) rather than
-  hanging forever waiting for someone who was never going to answer.
+  message, with one real difference: no human is *live in the
+  conversation* when it fires unattended. What happens to an "ask"
+  decision then depends on the target agent's own config: with no
+  `httpNotifier` set, it auto-resolves immediately (denied / a fixed
+  "no human available" answer) rather than hanging forever on someone
+  who was never going to answer; with one configured (a webhook, Slack,
+  ...), it becomes a *real* durable approval instead — the run genuinely
+  pauses (`status: "awaiting_approval"`) until a human decides there,
+  same as any other durably-gated call in this framework.
 - **Tool** — `list_scheduled_tasks(status?)`. Every scheduled task
   across every agent in the project — summary fields only
   (`task_id`, `agent`, `schedule`, `status`, `next_run_at`, `run_count`,
@@ -30,14 +34,19 @@ to use it.
 - **Tool** — `check_scheduled_task(task_id)`. One task's full record —
   schedule, status, `next_run_at`, and up to the last 20 runs, each with
   its own `status` (`"ok"` with the target agent's reply text, or
-  `"error"` with what went wrong).
+  `"error"` with what went wrong). `status: "awaiting_approval"` means
+  the current fire is paused on a real durable approval — `pending`
+  identifies which run.
 - **Tool** — `cancel_scheduled_task(task_id)`. Stops a task from firing
   again. History stays intact (`status` becomes `"cancelled"`, nothing
-  is deleted).
+  is deleted) — doesn't retract an approval already in flight for a
+  fire that's currently `"awaiting_approval"`.
 - **Skill** — `task-scheduling`: when to actually reach for this versus
-  just answering now, choosing `run_at` vs `every`, what "no human
-  present" really means for the target agent's own tool calls, and how
-  to report a task's run history back usefully.
+  just answering now, choosing `run_at` vs `every`, what "no human live
+  in the conversation" really means for the target agent's own tool
+  calls (auto-resolved vs a real durable approval, depending on that
+  agent's own config), and how to report a task's run history back
+  usefully.
 - **actauth rules** — all four tools `decision: allow`. None has a
   destructive or irreversible side effect; the real ongoing cost (a
   recurring task billing model calls forever until cancelled) isn't
@@ -71,6 +80,21 @@ installed under — only the ability's own install needs to be singular.
 recurring task's `next_run_at` passed, it fires once on restart and
 schedules fresh from that moment — not once for every interval that
 was missed while it was down.
+
+**Durable approval needs no loopengine core changes at all.** When an
+'ask' decision durably pends, this ability persists a checkpoint via
+`createCheckpointStore()` and reads back the resumed turn's own final
+answer via `createSessionStore()` — both public `loopengine` exports
+that resolve their own backing purely from env vars (`REDIS_URL`, or a
+fixed local path) at construction time, with nothing passed in. Since
+this file runs inside the exact same process as `adapters/http.ts`,
+reading the exact same env vars, an instance created here and that
+file's own already-running equivalent are backed by the identical
+store — `adapters/http.ts`'s own already-existing
+`/pending-approvals/:id/resolve` route, completely unmodified, is what
+actually resolves a checkpoint this file creates. Verified live, across
+two separate Node processes, including a chained second approval
+spawned by resolving the first.
 
 ## Install
 
