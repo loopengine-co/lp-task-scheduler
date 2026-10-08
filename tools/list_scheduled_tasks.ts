@@ -1,12 +1,16 @@
 import { readFile, readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { ToolDefinition } from 'loopengine'
 
 // Mirrors schedule_task.ts's own TaskRecord/path convention exactly —
 // the two tools can't share a module (add-ability copies each tool file
 // standalone, flattened, with no shared-module support), so this on-disk
 // path/shape convention is the actual contract between every tool file
-// in this ability, not a shared function.
+// in this ability, not a shared function. STORE_DIR's own inference
+// below has to match schedule_task.ts's exactly, not just conceptually
+// — a mismatch means this tool silently looks in the wrong directory
+// and finds nothing schedule_task.ts actually created.
 interface TaskRecord {
   task_id: string
   task_name?: string
@@ -23,7 +27,20 @@ interface TaskRecord {
   last_error?: string
 }
 
-const STORE_DIR = process.env.SCHEDULER_STORE_DIR || './generated/scheduled-tasks'
+// See schedule_task.ts's own inferAgentName doc comment for why this
+// exists at all — must stay byte-for-byte identical to that copy.
+function inferAgentName(): string | undefined {
+  try {
+    const toolsDir = dirname(fileURLToPath(import.meta.url))
+    const agentDir = dirname(toolsDir)
+    if (basename(dirname(agentDir)) !== 'agents') return undefined
+    return basename(agentDir)
+  } catch {
+    return undefined
+  }
+}
+
+const STORE_DIR = process.env.SCHEDULER_STORE_DIR || join('./generated/scheduled-tasks', inferAgentName() ?? '')
 
 async function listTaskIds(): Promise<string[]> {
   const entries = await readdir(join(STORE_DIR, '.tasks')).catch(() => [] as string[])

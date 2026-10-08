@@ -67,14 +67,25 @@ every other agent in it already lives) and calls `runAgent` on it
 directly, exactly the mechanism an HTTP request would otherwise go
 through, just without one.
 
-**Install this ability under only one agent per project.** Each agent
-that installs it gets its own copy of `schedule_task.ts`, at a
-different file path — Node treats those as separate modules and starts
-a separate timer loop for each, so installing it twice means two loops
-both polling the same `SCHEDULER_STORE_DIR` and firing every due task
-twice. A scheduled task's own `agent` field can still target *any*
-agent in the project regardless of which one the ability itself is
-installed under — only the ability's own install needs to be singular.
+**Installing this ability under more than one agent is safe by
+default.** Each agent that installs it gets its own copy of
+`schedule_task.ts`, at a different file path — Node treats those as
+separate modules and starts a separate timer loop for each, even when
+both agents run inside the exact same process. Two loops polling the
+*same* `SCHEDULER_STORE_DIR` would fire every due task twice —
+confirmed live while building this — so `SCHEDULER_STORE_DIR`'s own
+default isn't one fixed path: it's inferred from each copy's own real
+location on disk (`agents/<name>/tools/schedule_task.ts`), giving every
+install its own naturally-separate subdirectory
+(`generated/scheduled-tasks/<name>/`) with zero configuration needed —
+confirmed live, two installs sharing one process and one `.env`, each
+correctly isolated. Setting `SCHEDULER_STORE_DIR` explicitly still
+overrides this outright, for a deployment that deliberately wants every
+installed copy to share one store (the double-fire risk above applies
+again if more than one agent's own loop ends up pointed at the same
+explicit value). A scheduled task's own `agent` field can target *any*
+agent in the project regardless of which one (or how many) host this
+ability.
 
 **A missed run isn't caught up.** If this process was down when a
 recurring task's `next_run_at` passed, it fires once on restart and
@@ -104,13 +115,15 @@ npx loopengine add-ability lp-task-scheduler --agent <your-agent>
 
 Then optionally set:
 - `SCHEDULER_STORE_DIR` — where task records and run history live.
-  Defaults to `./generated/scheduled-tasks`.
+  Defaults to `./generated/scheduled-tasks/<agent-name>` (inferred from
+  where this ability is actually installed — see "How it actually
+  runs" above for why that's per-agent, not one fixed path).
 - `SCHEDULER_TICK_INTERVAL_MS` — how often the background loop checks
   for due tasks. Defaults to `10000` (10 seconds).
 
-If using `local`-style defaults, add `SCHEDULER_STORE_DIR` (default
-`generated/scheduled-tasks`) to your project's own `.gitignore` if you
-don't want to commit task records.
+If using the default store location, add `generated/scheduled-tasks/`
+to your project's own `.gitignore` if you don't want to commit task
+records.
 
 ## Upgrading
 

@@ -1,5 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { ToolDefinition } from 'loopengine'
 
 // See list_scheduled_tasks.ts's own comment on why this is duplicated,
@@ -10,14 +11,27 @@ interface TaskRecord {
   agent: string
   message: string
   schedule: { run_at: string } | { every: string }
-  status: 'scheduled' | 'cancelled' | 'done'
+  status: 'scheduled' | 'cancelled' | 'done' | 'awaiting_approval'
   created_at: string
   next_run_at?: string
   run_count: number
   [key: string]: unknown
 }
 
-const STORE_DIR = process.env.SCHEDULER_STORE_DIR || './generated/scheduled-tasks'
+// See schedule_task.ts's own inferAgentName doc comment for why this
+// exists at all — must stay byte-for-byte identical to that copy.
+function inferAgentName(): string | undefined {
+  try {
+    const toolsDir = dirname(fileURLToPath(import.meta.url))
+    const agentDir = dirname(toolsDir)
+    if (basename(dirname(agentDir)) !== 'agents') return undefined
+    return basename(agentDir)
+  } catch {
+    return undefined
+  }
+}
+
+const STORE_DIR = process.env.SCHEDULER_STORE_DIR || join('./generated/scheduled-tasks', inferAgentName() ?? '')
 
 function taskFilePath(taskId: string): string {
   return join(STORE_DIR, '.tasks', `${taskId}.json`)

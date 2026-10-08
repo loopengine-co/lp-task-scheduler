@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createCheckpointStore, createSessionStore, discoverAgents, runAgent, type Message, type OutstandingItem, type ToolDefinition } from 'loopengine'
 
 // This file's own top-level code (startScheduler() at the bottom) is
@@ -17,17 +18,28 @@ import { createCheckpointStore, createSessionStore, discoverAgents, runAgent, ty
 // (`run_at`) or a plain interval (`every`, e.g. "15m"/"1h"/"1d"), both
 // trivial to compute "next run" from without a dependency.
 //
-// Install this ability under only ONE agent per project. Each agent
-// that installs it gets its OWN copy of this file at a different path
-// (agents/agentA/tools/schedule_task.ts vs agents/agentB/tools/
-// schedule_task.ts are different ES module specifiers, so Node
-// instantiates — and starts a scheduler loop for — each one
-// separately) — installing it twice in the same project means two
-// independent loops both polling SCHEDULER_STORE_DIR, which (if left
-// at its own shared default) means every due task fires twice —
-// confirmed live while testing this exact file. A scheduled task's own
-// `agent` field can still target any agent in the project; only the
-// *scheduler ability itself* needs a single home.
+// Each agent that installs this ability gets its OWN copy of this file
+// at a different path (agents/agentA/tools/schedule_task.ts vs
+// agents/agentB/tools/schedule_task.ts are different ES module
+// specifiers, so Node instantiates — and starts a scheduler loop for —
+// each one separately), even when both agents run inside the exact
+// same process. Two such loops polling the identical SCHEDULER_STORE_DIR
+// means every due task fires twice — confirmed live while testing this
+// exact file. SCHEDULER_STORE_DIR's own default (see inferAgentName
+// below) is a per-agent subdirectory specifically to close this: two
+// agents installing this ability in the same project get two
+// naturally-separate task stores with zero configuration needed,
+// instead of silently racing on one shared file the moment a second
+// agent installs it. Setting SCHEDULER_STORE_DIR explicitly still wins
+// outright over this inferred default — for a deployment that
+// deliberately wants every installed copy to share one task store
+// (watch for the exact same double-fire risk this default exists to
+// avoid if more than one agent's own loop ends up pointed at it), or
+// one that runs each agent as a fully separate process anyway (where
+// the inferred default already differs automatically, but an explicit
+// value works just as well). A scheduled task's own `agent` field can
+// still target any agent in the project regardless of which one (or
+// how many) host this ability.
 //
 // An 'ask' decision a fired task hits can become a real, later-
 // resolvable durable approval — not just an immediate auto-deny — when
@@ -90,13 +102,38 @@ interface TaskRecord {
   history: TaskRunRecord[]
 }
 
-const STORE_DIR = process.env.SCHEDULER_STORE_DIR || './generated/scheduled-tasks'
+// Reads this exact file's own real location on disk (see the
+// top-of-file doc comment on why) — agents/<name>/tools/schedule_task.ts
+// is the fixed path every ability install already follows, so
+// basename(dirname(dirname(<this file>))) recovers <name> reliably.
+// Returns undefined for anything that doesn't match that exact shape —
+// this file run standalone, outside an agents/<name>/tools/ directory
+// (every test harness this ability was built and verified against, for
+// instance) — rather than guessing at a name that isn't really there;
+// STORE_DIR's own fallback below treats that the same as "no agent
+// name available," not an error.
+function inferAgentName(): string | undefined {
+  try {
+    const toolsDir = dirname(fileURLToPath(import.meta.url))
+    const agentDir = dirname(toolsDir)
+    if (basename(dirname(agentDir)) !== 'agents') return undefined
+    return basename(agentDir)
+  } catch {
+    return undefined
+  }
+}
+
+const STORE_DIR = process.env.SCHEDULER_STORE_DIR || join('./generated/scheduled-tasks', inferAgentName() ?? '')
 // Matches every other ability this session's own AD_IMAGE_OUTPUT_DIR/
 // ARCHIVE_OUTPUT_DIR convention: process.cwd() is this server process's
 // own working directory (the project root, normally), not this file's
 // location — agents/ lives there by the same fixed convention
 // run-agent.ts's own loadRules/loadDefaultTools already assume
-// (agents/<name>/...), so there's no separate env var for it.
+// (agents/<name>/...), so there's no separate env var for it. Unlike
+// STORE_DIR above, this one every agent's own copy of this file
+// legitimately needs to resolve to the *same* real directory — it's
+// how a scheduled task reaches a *different* agent than whichever one
+// is hosting this ability, not something to keep separate per install.
 const AGENTS_DIR = join(process.cwd(), 'agents')
 // How often the background loop checks for due tasks — deliberately
 // finer than a minute (unlike real cron) so a short "every": "30s"

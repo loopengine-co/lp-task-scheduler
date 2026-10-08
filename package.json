@@ -1,6 +1,6 @@
 {
   "name": "lp-task-scheduler",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A loopengine ability: a schedule_task/list_scheduled_tasks/check_scheduled_task/cancel_scheduled_task tool set that fires a message into any agent in the project later — once at a given time, or on a recurring interval — the same way a cron job runs a command on a timer, plus a skill on how to use it.",
   "license": "MIT",
   "keywords": ["loopengine", "loopengine-ability", "scheduler", "cron", "automation"],
