@@ -4,7 +4,7 @@
   "skills": ["skills/task-scheduling"],
   "actauth": "actauth/rules.yml",
   "env": [
-    { "name": "SCHEDULER_STORE_DIR", "description": "Where scheduled-task records and run history are written. Defaults to ./generated/scheduled-tasks if unset.", "secret": false },
+    { "name": "SCHEDULER_STORE_DIR", "description": "Where scheduled-task records and run history are written. Defaults to ./generated/scheduled-tasks/<agent-name> if unset — <agent-name> is inferred from wherever this ability is actually installed, so two agents installing it in the same project default to two separate, non-conflicting stores automatically. Set this explicitly to use one shared store instead (only safe if no more than one agent's own copy of this ability ever points at it).", "secret": false },
     { "name": "SCHEDULER_TICK_INTERVAL_MS", "description": "How often (in milliseconds) the background loop checks for due tasks. Defaults to 10000 (10 seconds) if unset — lower it for tighter timing on short \"every\" intervals, raise it to reduce filesystem polling on a deployment with many scheduled tasks.", "secret": false }
   ]
 }
