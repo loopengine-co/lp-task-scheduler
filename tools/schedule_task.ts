@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createCheckpointStore, createSessionStore, discoverAgents, runAgent, type Message, type OutstandingItem, type ToolDefinition } from 'loopengine'
+import { createAgentEnv, createCheckpointStore, createSessionStore, discoverAgents, runAgent, type Message, type OutstandingItem, type ToolDefinition } from 'loopengine'
 
 // This file's own top-level code (startScheduler() at the bottom) is
 // what actually runs the scheduler — not the schedule_task tool's own
@@ -123,7 +123,13 @@ function inferAgentName(): string | undefined {
   }
 }
 
-const STORE_DIR = process.env.SCHEDULER_STORE_DIR || join('./generated/scheduled-tasks', inferAgentName() ?? '')
+// The background loop below has no ToolContext to read settings from, so
+// this file builds the same per-agent view itself, from its own folder —
+// the agent's own .env first, then the project's (loopengine's
+// createAgentEnv). Every tool file in this ability does the same, so
+// they and the loop always agree on STORE_DIR.
+const AGENT_ENV = createAgentEnv(inferAgentName() ?? '', dirname(dirname(fileURLToPath(import.meta.url))))
+const STORE_DIR = AGENT_ENV.get('SCHEDULER_STORE_DIR') || join('./generated/scheduled-tasks', inferAgentName() ?? '')
 // Matches every other ability this session's own AD_IMAGE_OUTPUT_DIR/
 // ARCHIVE_OUTPUT_DIR convention: process.cwd() is this server process's
 // own working directory (the project root, normally), not this file's
@@ -139,7 +145,7 @@ const AGENTS_DIR = join(process.cwd(), 'agents')
 // finer than a minute (unlike real cron) so a short "every": "30s"
 // interval is actually honored close to on time, not held up to a
 // whole minute's own granularity.
-const TICK_INTERVAL_MS = Number(process.env.SCHEDULER_TICK_INTERVAL_MS) || 10_000
+const TICK_INTERVAL_MS = Number(AGENT_ENV.get('SCHEDULER_TICK_INTERVAL_MS')) || 10_000
 const HISTORY_LIMIT = 20
 
 function taskFilePath(taskId: string): string {

@@ -1,7 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { ToolDefinition } from 'loopengine'
+import { createAgentEnv, type ToolDefinition } from 'loopengine'
 
 // See list_scheduled_tasks.ts's own comment on why this is duplicated,
 // not shared, across every tool file in this ability.
@@ -31,7 +31,13 @@ function inferAgentName(): string | undefined {
   }
 }
 
-const STORE_DIR = process.env.SCHEDULER_STORE_DIR || join('./generated/scheduled-tasks', inferAgentName() ?? '')
+// The background loop below has no ToolContext to read settings from, so
+// this file builds the same per-agent view itself, from its own folder —
+// the agent's own .env first, then the project's (loopengine's
+// createAgentEnv). Every tool file in this ability does the same, so
+// they and the loop always agree on STORE_DIR.
+const AGENT_ENV = createAgentEnv(inferAgentName() ?? '', dirname(dirname(fileURLToPath(import.meta.url))))
+const STORE_DIR = AGENT_ENV.get('SCHEDULER_STORE_DIR') || join('./generated/scheduled-tasks', inferAgentName() ?? '')
 
 function taskFilePath(taskId: string): string {
   return join(STORE_DIR, '.tasks', `${taskId}.json`)

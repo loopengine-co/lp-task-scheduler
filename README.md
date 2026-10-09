@@ -117,7 +117,10 @@ Then optionally set:
 - `SCHEDULER_STORE_DIR` — where task records and run history live.
   Defaults to `./generated/scheduled-tasks/<agent-name>` (inferred from
   where this ability is actually installed — see "How it actually
-  runs" above for why that's per-agent, not one fixed path).
+  runs" above for why that's per-agent, not one fixed path). To move
+  one agent's store, set it on that agent in the Admin UI's Environment
+  tab (its own `agents/<name>/.env`) rather than project-wide, which
+  keeps every agent's loop on its own directory.
 - `SCHEDULER_TICK_INTERVAL_MS` — how often the background loop checks
   for due tasks. Defaults to `10000` (10 seconds).
 
